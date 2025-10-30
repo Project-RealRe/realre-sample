@@ -5,9 +5,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+
+from ._http_helpers import normalize_params, request_bytes
 
 VWORLD_METADATA_PATH = (Path(__file__).resolve().parent / "vworld" / "vworld_url.json").resolve()
 VWORLD_SEARCH_ENDPOINT = "https://api.vworld.kr/req/search"
@@ -78,25 +77,6 @@ def get_vworld_api_info(api_name: str) -> VWorldApiDefinition:
         raise VWorldAPIError(f"Unknown vworld API '{api_name}'. Available APIs: {available}") from exc
 
 
-def _normalize_params(params: Mapping[str, Any] | None) -> dict[str, Any]:
-    if not params:
-        return {}
-
-    normalized: dict[str, Any] = {}
-    for key, value in params.items():
-        if value is None:
-            continue
-
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            sequence = [str(item) for item in value if item is not None]
-            if sequence:
-                normalized[key] = sequence
-            continue
-
-        normalized[key] = str(value)
-    return normalized
-
-
 def call_vworld_api(
     api_name: str,
     params: Mapping[str, Any] | None = None,
@@ -146,7 +126,7 @@ def call_vworld_api(
     api_info = get_vworld_api_info(api_name)
     request_fields = api_info.request_fields
 
-    query_params = _normalize_params(params)
+    query_params = normalize_params(params)
     if api_key is not None:
         query_params.setdefault("key", api_key)
     if domain is not None:
@@ -162,19 +142,14 @@ def call_vworld_api(
             f"Missing required parameters for '{api_name}': {', '.join(sorted(missing))}"
         )
 
-    encoded_params = urlencode(query_params, doseq=True)
-    request_url = api_info.endpoint if not encoded_params else f"{api_info.endpoint}?{encoded_params}"
-
-    try:
-        with urlopen(request_url, timeout=timeout) as response:
-            raw_body = response.read()
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as exc:
-        raise VWorldAPIError(
-            f"vworld API '{api_name}' returned HTTP {exc.code}: {exc.reason}"
-        ) from exc
-    except URLError as exc:
-        raise VWorldAPIError(f"Failed to reach vworld API '{api_name}': {exc.reason}") from exc
+    raw_body, headers = request_bytes(
+        api_info.endpoint,
+        query_params,
+        timeout=timeout,
+        error_cls=VWorldAPIError,
+        service_name=f"vworld API '{api_name}'",
+    )
+    content_type = headers.get("Content-Type", "")
 
     if parse_json is None:
         format_param = str(query_params.get("format", "")).lower()
@@ -191,113 +166,21 @@ def call_vworld_api(
     return raw_body.decode("utf-8")
 
 
-def search_address(
-    address: str,
-    *,
-    api_key: str,
-    category: str = "ROAD",
-    crs: str = "EPSG:4326",
-    size: int = 10,
-    page: int = 1,
-    bbox: Sequence[float] | None = None,
-    domain: str | None = None,
-    timeout: float = 10.0,
-    format: str = "json",
-    errorformat: str = "json",
+def _perform_address_search_request(
+    base_params: dict[str, Any],
+    category: str,
+    timeout: float,
 ) -> dict[str, Any]:
-    """
-    Query the vworld Search API for address information.
+    query_params = dict(base_params)
+    query_params["category"] = category.upper()
 
-    Parameters
-    ----------
-    address:
-        Human-readable address string (도로명 or 지번).
-    api_key:
-        vworld issued API key.
-    category:
-        Address category to search. Must be ``"ROAD"`` or ``"PARCEL"`` when ``type=address``.
-    crs:
-        Coordinate reference system to receive results in (e.g. ``"EPSG:4326"``).
-    size:
-        Number of results to request (1-1000).
-    page:
-        Page number to request (>=1).
-    bbox:
-        Optional bounding box (minx, miny, maxx, maxy) to spatially constrain the search.
-    domain:
-        Optional domain parameter to include in the request.
-    timeout:
-        Socket timeout (seconds) passed to ``urllib.request.urlopen``.
-    format:
-        Response format requested from the API. Only ``"json"`` is supported by this helper.
-    errorformat:
-        Error response format. Only ``"json"`` is supported by this helper.
-
-    Returns
-    -------
-    dict[str, Any]
-        Parsed JSON ``response`` block from the Search API.
-
-    Raises
-    ------
-    ValueError
-        If arguments are malformed (e.g. empty address, invalid size/page, unsupported category).
-    VWorldAPIError
-        If the API request fails or returns a non-JSON payload.
-    """
-    if not address or not address.strip():
-        raise ValueError("address must be a non-empty string.")
-    if not api_key or not api_key.strip():
-        raise ValueError("api_key must be provided.")
-    if size < 1 or size > 1000:
-        raise ValueError("size must be between 1 and 1000.")
-    if page < 1:
-        raise ValueError("page must be greater than or equal to 1.")
-    if timeout <= 0:
-        raise ValueError("timeout must be greater than zero.")
-    if format.lower() != "json":
-        raise ValueError("only JSON format responses are supported by this helper.")
-    if errorformat.lower() != "json":
-        raise ValueError("only JSON errorformat responses are supported by this helper.")
-    normalized_category = category.strip().lower()
-    if normalized_category not in {"road", "parcel"}:
-        raise ValueError("category must be either 'ROAD' or 'PARCEL' for address searches.")
-
-    query_params: dict[str, Any] = {
-        "service": "search",
-        "request": "search",
-        "version": "2.0",
-        "format": format,
-        "errorformat": errorformat,
-        "type": "address",
-        "category": normalized_category,
-        "crs": crs,
-        "size": size,
-        "page": page,
-        "query": address.strip(),
-        "key": api_key.strip(),
-    }
-
-    if bbox is not None:
-        if len(bbox) != 4:
-            raise ValueError("bbox must contain exactly four values: minx, miny, maxx, maxy.")
-        query_params["bbox"] = ",".join(str(value) for value in bbox)
-
-    if domain:
-        query_params["domain"] = domain
-
-    encoded_params = urlencode(_normalize_params(query_params), doseq=True)
-    request_url = f"{VWORLD_SEARCH_ENDPOINT}?{encoded_params}"
-
-    try:
-        with urlopen(request_url, timeout=timeout) as response:
-            raw_body = response.read()
-    except HTTPError as exc:
-        raise VWorldAPIError(
-            f"vworld address search returned HTTP {exc.code}: {exc.reason}"
-        ) from exc
-    except URLError as exc:
-        raise VWorldAPIError(f"Failed to reach vworld address search: {exc.reason}") from exc
+    raw_body, _ = request_bytes(
+        VWORLD_SEARCH_ENDPOINT,
+        query_params,
+        timeout=timeout,
+        error_cls=VWorldAPIError,
+        service_name="vworld address search",
+    )
 
     try:
         payload = json.loads(raw_body.decode("utf-8"))
@@ -334,6 +217,107 @@ def search_address(
         )
 
     return response_data
+
+
+def search_address(
+    address: str,
+    *,
+    api_key: str,
+    category: str = "ROAD",
+    crs: str = "EPSG:4326",
+    size: int = 10,
+    page: int = 1,
+    bbox: Sequence[float] | None = None,
+    domain: str | None = None,
+    timeout: float = 10.0,
+    format: str = "json",
+    errorformat: str = "json",
+) -> dict[str, Any]:
+    """
+    Query the vworld Search API for address information.
+
+    Parameters
+    ----------
+    address:
+        Human-readable address string (도로명 or 지번).
+    api_key:
+        vworld issued API key.
+    category:
+        Deprecated. The helper always searches ``"ROAD"`` first and falls back to
+        ``"PARCEL"`` automatically when no results are returned.
+    crs:
+        Coordinate reference system to receive results in (e.g. ``"EPSG:4326"``).
+    size:
+        Number of results to request (1-1000).
+    page:
+        Page number to request (>=1).
+    bbox:
+        Optional bounding box (minx, miny, maxx, maxy) to spatially constrain the search.
+    domain:
+        Optional domain parameter to include in the request.
+    timeout:
+        Socket timeout (seconds) passed to ``urllib.request.urlopen``.
+    format:
+        Response format requested from the API. Only ``"json"`` is supported by this helper.
+    errorformat:
+        Error response format. Only ``"json"`` is supported by this helper.
+
+    Returns
+    -------
+    dict[str, Any]
+        Parsed JSON ``response`` block from the Search API.
+
+    Raises
+    ------
+    ValueError
+        If arguments are malformed (e.g. empty address, invalid size/page).
+    VWorldAPIError
+        If the API request fails or returns a non-JSON payload.
+    """
+    _ = category  # Kept for compatibility; actual search order is ROAD then PARCEL.
+
+    if not address or not address.strip():
+        raise ValueError("address must be a non-empty string.")
+    if not api_key or not api_key.strip():
+        raise ValueError("api_key must be provided.")
+    if size < 1 or size > 1000:
+        raise ValueError("size must be between 1 and 1000.")
+    if page < 1:
+        raise ValueError("page must be greater than or equal to 1.")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero.")
+    if format.lower() != "json":
+        raise ValueError("only JSON format responses are supported by this helper.")
+    if errorformat.lower() != "json":
+        raise ValueError("only JSON errorformat responses are supported by this helper.")
+    query_params: dict[str, Any] = {
+        "service": "search",
+        "request": "search",
+        "version": "2.0",
+        "format": format,
+        "errorformat": errorformat,
+        "type": "address",
+        "crs": crs,
+        "size": size,
+        "page": page,
+        "query": address.strip(),
+        "key": api_key.strip(),
+    }
+
+    if bbox is not None:
+        if len(bbox) != 4:
+            raise ValueError("bbox must contain exactly four values: minx, miny, maxx, maxy.")
+        query_params["bbox"] = ",".join(str(value) for value in bbox)
+
+    if domain:
+        query_params["domain"] = domain
+
+    road_response = _perform_address_search_request(query_params, "ROAD", timeout)
+    if road_response.get("status") != "NOT_FOUND":
+        return road_response
+
+    parcel_response = _perform_address_search_request(query_params, "PARCEL", timeout)
+    return parcel_response
 
 
 __all__ = [
